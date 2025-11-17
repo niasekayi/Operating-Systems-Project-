@@ -1,0 +1,138 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/wait.h>
+
+typedef struct {
+    sem_t mutex;
+    int balance;
+} SharedData;
+
+int ShmID = -1;
+SharedData *ShmPTR = NULL;
+pid_t child_pid = -1;
+
+void cleanup_and_exit(int signo) {
+    if (child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        waitpid(child_pid, NULL, 0);
+    }
+    if (ShmPTR != NULL) {
+        sem_destroy(&ShmPTR->mutex);
+        shmdt((void *) ShmPTR);
+    }
+    if (ShmID != -1) {
+        shmctl(ShmID, IPC_RMID, NULL);
+    }
+    printf("\nCleanup done. Exiting.\n");
+    exit(0);
+}
+
+void parent_process(SharedData *shared) {
+    int localBalance = shared->balance;
+    srand(time(NULL) ^ (getpid()<<16));
+    while (1) {
+        int sleepTime = rand() % 6; // 0-5
+        sleep(sleepTime);
+        printf("Dear Old Dad: Attempting to Check Balance\n");
+        int coin = rand() % 2; // even/odd
+        if (coin == 0) { // even -> maybe deposit
+            if (localBalance < 100) {
+                sem_wait(&shared->mutex);
+                localBalance = shared->balance;
+                int amount = rand() % 101; // 0-100
+                int decision = rand() % 2;
+                if (decision == 0) { // even -> deposit
+                    localBalance += amount;
+                    printf("Dear old Dad: Deposits $%d / Balance = $%d\n", amount, localBalance);
+                } else {
+                    printf("Dear old Dad: Doesn't have any money to give\n");
+                }
+                shared->balance = localBalance;
+                sem_post(&shared->mutex);
+            } else {
+                printf("Dear old Dad: Thinks Student has enough Cash ($%d)\n", localBalance);
+            }
+        } else { // odd -> just check
+            printf("Dear Old Dad: Last Checking Balance = $%d\n", localBalance);
+        }
+    }
+}
+
+void child_process(SharedData *shared) {
+    int localBalance = shared->balance;
+    srand(time(NULL) ^ getpid());
+    while (1) {
+        int sleepTime = rand() % 6; // 0-5
+        sleep(sleepTime);
+        printf("Poor Student: Attempting to Check Balance\n");
+        int coin = rand() % 2;
+        if (coin == 0) { // even -> attempt withdraw
+            sem_wait(&shared->mutex);
+            localBalance = shared->balance;
+            int need = (rand() % 50) + 1; // 1-50
+            printf("Poor Student needs $%d\n", need);
+            if (need <= localBalance) {
+                localBalance -= need;
+                printf("Poor Student: Withdraws $%d / Balance = $%d\n", need, localBalance);
+            } else {
+                printf("Poor Student: Not Enough Cash ($%d)\n", localBalance);
+            }
+            shared->balance = localBalance;
+            sem_post(&shared->mutex);
+        } else {
+            printf("Poor Student: Last Checking Balance = $%d\n", localBalance);
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int initial = 0;
+    if (argc >= 2) {
+        initial = atoi(argv[1]);
+        if (initial < 0) initial = 0;
+    }
+
+    ShmID = shmget(IPC_PRIVATE, sizeof(SharedData), IPC_CREAT | 0666);
+    if (ShmID < 0) {
+        perror("shmget");
+        exit(1);
+    }
+
+    ShmPTR = (SharedData *) shmat(ShmID, NULL, 0);
+    if (ShmPTR == (void *) -1) {
+        perror("shmat");
+        shmctl(ShmID, IPC_RMID, NULL);
+        exit(1);
+    }
+
+    if (sem_init(&ShmPTR->mutex, 1, 1) != 0) {
+        perror("sem_init");
+        shmdt((void *) ShmPTR);
+        shmctl(ShmID, IPC_RMID, NULL);
+        exit(1);
+    }
+
+    ShmPTR->balance = initial;
+    signal(SIGINT, cleanup_and_exit);
+    signal(SIGTERM, cleanup_and_exit);
+
+    child_pid = fork();
+    if (child_pid < 0) {
+        perror("fork");
+        cleanup_and_exit(0);
+    } else if (child_pid == 0) {
+        child_process(ShmPTR);
+        exit(0);
+    } else {
+        parent_process(ShmPTR);
+    }
+
+    return 0;
+}
